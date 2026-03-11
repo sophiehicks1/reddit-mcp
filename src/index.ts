@@ -273,13 +273,14 @@ function walkListing(
  * Maximum number of /api/morechildren API calls to issue for a single
  * get_post_details request.
  *
- * Each call fetches up to BATCH_SIZE (100) comment IDs.  At Reddit's OAuth
- * rate limit of 60 requests/minute, 100 calls equates to roughly 100 seconds
- * of API time and up to ~10 000 comments in the best case (fewer when
- * comments are deleted or batches are smaller).  Posts that still have
- * unresolved stubs after this cap will include a warning in the response.
+ * Each call fetches up to BATCH_SIZE (100) comment IDs. At Reddit's OAuth
+ * rate limit of 60 requests/minute, 100,000 calls equates to roughly 28 hours
+ * of API time and up to ~10m comments in the best case (fewer when
+ * comments are deleted or batches are smaller), so this limit is essentially
+ * infinite. Posts that still have unresolved stubs after this cap will include
+ * a warning in the response.
  */
-const MAX_MORE_CALLS = 100;
+const MAX_MORE_CALLS = 100000;
 
 /**
  * Resolve all "more" stubs by iteratively calling /api/morechildren.
