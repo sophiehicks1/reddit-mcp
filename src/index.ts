@@ -3,11 +3,12 @@
  * Reddit MCP Server
  *
  * Provides Claude Code with read-only access to Reddit via the official Reddit
- * OAuth2 API.  All credentials are loaded exclusively from environment
- * variables (see .env.example) and are never stored on disk by this process.
+ * OAuth2 API.  Credentials are loaded from the OS keychain (set up with
+ * `npm run setup`) and never need to appear in any file or shell config.
+ * Environment variables / a local .env file are accepted as a fallback for
+ * headless/CI environments.
  */
 
-import * as dotenv from "dotenv";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -16,8 +17,8 @@ import {
   McpError,
   ErrorCode,
 } from "@modelcontextprotocol/sdk/types.js";
-
-dotenv.config();
+import { loadCredentials } from "./credentials";
+import type { Credentials } from "./credentials";
 
 // ---------------------------------------------------------------------------
 // Reddit OAuth2 client
@@ -29,16 +30,13 @@ interface RedditToken {
 }
 
 let cachedToken: RedditToken | null = null;
+let cachedCredentials: Credentials | null = null;
 
-function requireEnv(name: string): string {
-  const value = process.env[name];
-  if (!value) {
-    throw new Error(
-      `Missing required environment variable: ${name}. ` +
-        `Please copy .env.example to .env and fill in your credentials.`
-    );
+async function getCredentials(): Promise<Credentials> {
+  if (!cachedCredentials) {
+    cachedCredentials = await loadCredentials();
   }
-  return value;
+  return cachedCredentials;
 }
 
 async function getAccessToken(): Promise<string> {
@@ -47,11 +45,8 @@ async function getAccessToken(): Promise<string> {
     return cachedToken.access_token;
   }
 
-  const clientId = requireEnv("REDDIT_CLIENT_ID");
-  const clientSecret = requireEnv("REDDIT_CLIENT_SECRET");
-  const username = requireEnv("REDDIT_USERNAME");
-  const password = requireEnv("REDDIT_PASSWORD");
-  const userAgent = requireEnv("REDDIT_USER_AGENT");
+  const { clientId, clientSecret, username, password, userAgent } =
+    await getCredentials();
 
   const credentials = Buffer.from(`${clientId}:${clientSecret}`).toString(
     "base64"
