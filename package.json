@@ -1,0 +1,38 @@
+{
+  "name": "reddit-mcp",
+  "version": "1.0.0",
+  "description": "An MCP to give Claude Code read-only access to Reddit via the API",
+  "main": "dist/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "setup": "ts-node src/setup.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sophiehicks1/reddit-mcp.git"
+  },
+  "keywords": [
+    "mcp",
+    "reddit",
+    "claude"
+  ],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/sophiehicks1/reddit-mcp/issues"
+  },
+  "homepage": "https://github.com/sophiehicks1/reddit-mcp#readme",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "dotenv": "^17.3.1",
+    "keytar": "^7.9.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.4.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}
