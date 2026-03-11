@@ -76,7 +76,22 @@ You need a **"script"** type Reddit OAuth2 application to authenticate as yourse
 
 ## Configuration
 
-Copy the example environment file and fill in your credentials:
+The recommended way to configure credentials is via the **OS keychain**:
+
+```bash
+npm run setup
+```
+
+This interactive command prompts for your Reddit app credentials and stores them
+securely in the OS keychain (macOS Keychain, Windows Credential Manager, or
+Linux Secret Service via libsecret).  No files are written to disk and no
+environment variables are needed.
+
+### Fallback: `.env` file
+
+If the OS keychain is not available (e.g. headless servers, CI), the setup
+script will fall back to writing a `.env` file with restrictive permissions
+(`600`).  You can also create one manually:
 
 ```bash
 cp .env.example .env
@@ -101,13 +116,23 @@ REDDIT_USER_AGENT=node:reddit-mcp:v1.0.0 (by /u/your_reddit_username)
 > **Never share or commit your `.env` file.**  
 > The file is already listed in `.gitignore` to prevent accidental commits.
 
+### Fallback: environment variables
+
+You can also export the variables directly in your shell or pass them through
+your MCP host configuration.  See the [environment variable reference](#environment-variable-reference) for the full list.
+
 ---
 
 ## Credential security
 
-Credentials are handled securely in the following ways:
+Credentials are resolved at runtime in the following order (highest priority first):
 
-- **Environment variables only** – credentials are loaded from the `.env` file (or the process environment) at runtime. They are never written to disk by the server itself.
+1. **OS keychain** (recommended) – stored via `npm run setup` in macOS Keychain, Windows Credential Manager, or Linux Secret Service.  Credentials never touch the filesystem and are protected by OS-level access controls.
+2. **Environment variables** – `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`, etc. can be set in the process environment.  Useful for CI or container deployments.
+3. **`.env` file** – loaded via [dotenv](https://github.com/motdotla/dotenv) from the project root.  Created with `600` permissions by the setup script when the keychain is unavailable.
+
+Additional safeguards:
+
 - **`.env` is gitignored** – the `.gitignore` file explicitly excludes `.env` to prevent accidental commits to version control.
 - **`.env.example` contains no real secrets** – only placeholder values are committed to the repository.
 - **Tokens are short-lived** – OAuth2 access tokens (obtained with the `password` grant for script-type apps) expire after 1 hour and are refreshed automatically in-memory. They are never written to disk.
@@ -120,17 +145,38 @@ Credentials are handled securely in the following ways:
 
 After building the project, register the MCP server with Claude Code.
 
+If you ran `npm run setup` to store credentials in the OS keychain, no
+environment variables need to be configured — the server loads them
+automatically.
+
 ### Option A – Claude Code CLI
 
 ```bash
 claude mcp add reddit-mcp -- node /absolute/path/to/reddit-mcp/dist/index.js
 ```
 
-Then set the required environment variables in the Claude Code MCP configuration or export them in your shell before launching Claude Code.
+If you are **not** using the keychain, set the required environment variables in
+the Claude Code MCP configuration or export them in your shell before launching
+Claude Code.
 
 ### Option B – `claude_desktop_config.json` (Claude Desktop)
 
-Add the server to your MCP configuration file (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
+Add the server to your MCP configuration file (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS).
+
+With **keychain credentials** (recommended — no `env` block needed):
+
+```json
+{
+  "mcpServers": {
+    "reddit-mcp": {
+      "command": "node",
+      "args": ["/absolute/path/to/reddit-mcp/dist/index.js"]
+    }
+  }
+}
+```
+
+With **environment variables** (fallback for headless/CI environments):
 
 ```json
 {
@@ -150,7 +196,7 @@ Add the server to your MCP configuration file (`~/Library/Application Support/Cl
 }
 ```
 
-> **Tip**: Store sensitive values as OS-level environment variables and reference them from your shell profile rather than pasting them directly into the JSON file.
+> **Tip**: Prefer `npm run setup` (OS keychain) over pasting secrets into JSON config files.
 
 ---
 

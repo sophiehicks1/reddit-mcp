@@ -284,7 +284,7 @@ const MAX_MORE_CALLS = 100;
 /**
  * Resolve all "more" stubs by iteratively calling /api/morechildren.
  * Returns true when the tree is fully resolved, false when the call cap was
- * reached (some stubs remain unresolved).
+ * reached, a batch failed, or some stubs remain unresolved.
  */
 async function resolveAllMore(
   postFullName: string,
@@ -293,6 +293,8 @@ async function resolveAllMore(
   initialPending: MoreStub[]
 ): Promise<boolean> {
   const BATCH_SIZE = 100;
+  const MAX_RETRIES = 3;
+  const BASE_DELAY_MS = 1000;
   let pending = initialPending;
   let callCount = 0;
   let fullyResolved = true;
@@ -310,61 +312,78 @@ async function resolveAllMore(
         const batch = stub.ids.slice(i, i + BATCH_SIZE);
         callCount++;
 
-        try {
-          const result = await redditGet<{
-            json: {
-              data: {
-                things: Array<{
-                  kind: string;
-                  data: Record<string, unknown>;
-                }>;
+        let success = false;
+        for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+          try {
+            const result = await redditGet<{
+              json: {
+                data: {
+                  things: Array<{
+                    kind: string;
+                    data: Record<string, unknown>;
+                  }>;
+                };
               };
-            };
-          }>("/api/morechildren", {
-            link_id: postFullName,
-            children: batch.join(","),
-            api_type: "json",
-          });
+            }>("/api/morechildren", {
+              link_id: postFullName,
+              children: batch.join(","),
+              api_type: "json",
+            });
 
-          const things = result?.json?.data?.things ?? [];
+            const things = result?.json?.data?.things ?? [];
 
-          for (const thing of things) {
-            if (thing.kind === "t1") {
-              const d = thing.data;
-              const id = String(d.id ?? "");
-              const parentFullId = String(d.parent_id ?? stub.parent_id);
+            for (const thing of things) {
+              if (thing.kind === "t1") {
+                const d = thing.data;
+                const id = String(d.id ?? "");
+                const parentFullId = String(d.parent_id ?? stub.parent_id);
 
-              commentMap.set(id, {
-                id,
-                author: String(d.author ?? "[deleted]"),
-                body: String(d.body ?? ""),
-                score: Number(d.score ?? 0),
-                created_utc: Number(d.created_utc ?? 0),
-                depth: Number(d.depth ?? 0),
-                parent_id: parentFullId,
-              });
-
-              const parentId = parentFullId.replace(/^t\d+_/, "");
-              if (!replyOrder.has(parentId)) replyOrder.set(parentId, []);
-              replyOrder.get(parentId)!.push(id);
-            } else if (thing.kind === "more") {
-              const d = thing.data;
-              const ids = Array.isArray(d.children)
-                ? d.children.map(String)
-                : [];
-              if (ids.length > 0) {
-                nextRound.push({
-                  ids,
-                  parent_id: String(d.parent_id ?? stub.parent_id),
+                commentMap.set(id, {
+                  id,
+                  author: String(d.author ?? "[deleted]"),
+                  body: String(d.body ?? ""),
+                  score: Number(d.score ?? 0),
+                  created_utc: Number(d.created_utc ?? 0),
+                  depth: Number(d.depth ?? 0),
+                  parent_id: parentFullId,
                 });
+
+                const parentId = parentFullId.replace(/^t\d+_/, "");
+                if (!replyOrder.has(parentId)) replyOrder.set(parentId, []);
+                replyOrder.get(parentId)!.push(id);
+              } else if (thing.kind === "more") {
+                const d = thing.data;
+                const ids = Array.isArray(d.children)
+                  ? d.children.map(String)
+                  : [];
+                if (ids.length > 0) {
+                  nextRound.push({
+                    ids,
+                    parent_id: String(d.parent_id ?? stub.parent_id),
+                  });
+                }
               }
             }
+
+            success = true;
+            break;
+          } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err);
+            const isRetryable = /\b(429|5\d{2})\b/.test(errMsg);
+            if (isRetryable && attempt < MAX_RETRIES - 1) {
+              const delay = BASE_DELAY_MS * Math.pow(2, attempt);
+              await new Promise((resolve) => setTimeout(resolve, delay));
+              continue;
+            }
+            // Final attempt failed or non-retryable error — log and continue.
+            console.error(
+              `morechildren batch failed (${batch.length} ids, attempt ${attempt + 1}): ${err}`
+            );
           }
-        } catch (err) {
-          // Log and skip; don't abort the whole traversal for one failed batch.
-          console.error(
-            `morechildren batch failed (${batch.length} ids): ${err}`
-          );
+        }
+
+        if (!success) {
+          fullyResolved = false;
         }
       }
 
@@ -380,7 +399,9 @@ async function resolveAllMore(
 
 /**
  * Build the nested RedditComment tree from the flat maps gathered during
- * tree traversal.
+ * tree traversal.  Comments whose parent is missing (e.g. deleted parents or
+ * partial fetches) are surfaced as additional top-level entries so they are
+ * not silently dropped.
  */
 function buildCommentTree(
   rootId: string,
@@ -407,8 +428,41 @@ function buildCommentTree(
     };
   }
 
+  // Track which comments are reachable from the true root subtree.
+  const visited = new Set<string>();
+  function markReachable(id: string): void {
+    if (visited.has(id)) return;
+    visited.add(id);
+    const childIds = replyOrder.get(id) ?? [];
+    for (const childId of childIds) {
+      markReachable(childId);
+    }
+  }
+
+  // Start with the normal top-level replies to the post/root.
   const topLevelIds = replyOrder.get(rootId) ?? [];
-  return topLevelIds
+  for (const id of topLevelIds) {
+    markReachable(id);
+  }
+
+  // Surface comments whose parent is missing (e.g. deleted/removed parents
+  // or partial fetches) as additional top-level roots so they aren't dropped.
+  const orphanRootIds: string[] = [];
+  for (const flat of commentMap.values()) {
+    if (visited.has(flat.id)) continue;
+
+    const parentId = flat.parent_id.replace(/^t\d+_/, "");
+    const parentMissing =
+      !parentId || (parentId !== rootId && !commentMap.has(parentId));
+
+    if (parentMissing) {
+      orphanRootIds.push(flat.id);
+      markReachable(flat.id);
+    }
+  }
+
+  const allRootIds = [...topLevelIds, ...orphanRootIds];
+  return allRootIds
     .map(build)
     .filter((c): c is RedditComment => c !== null);
 }
@@ -541,6 +595,23 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 // ---- Call tool ------------------------------------------------------------
 
+/**
+ * Validate that a string looks like a valid Reddit identifier (subreddit name,
+ * username, or post ID).  Reddit identifiers are alphanumeric with underscores
+ * and hyphens; they must not contain path separators, query strings, or other
+ * characters that could alter the request endpoint.
+ */
+const REDDIT_ID_RE = /^[A-Za-z0-9_\-]+$/;
+
+function validateRedditId(value: string, label: string): void {
+  if (!REDDIT_ID_RE.test(value)) {
+    throw new McpError(
+      ErrorCode.InvalidParams,
+      `Invalid ${label}: must contain only alphanumeric characters, underscores, or hyphens.`
+    );
+  }
+}
+
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args = {} } = request.params;
 
@@ -557,6 +628,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const query = String(args.query ?? "");
         if (!query)
           throw new McpError(ErrorCode.InvalidParams, "query is required");
+        if (args.subreddit) validateRedditId(String(args.subreddit), "subreddit");
         const sort = String(args.sort ?? "relevance");
         const time = String(args.time ?? "all");
         const limit = clampLimit(args.limit);
@@ -587,6 +659,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const postId = String(args.post_id ?? "");
         if (!postId)
           throw new McpError(ErrorCode.InvalidParams, "post_id is required");
+        validateRedditId(postId, "post_id");
+        if (args.subreddit) validateRedditId(String(args.subreddit), "subreddit");
 
         const sub = args.subreddit ? `/r/${String(args.subreddit)}` : "";
 
@@ -657,6 +731,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const subreddit = String(args.subreddit ?? "");
         if (!subreddit)
           throw new McpError(ErrorCode.InvalidParams, "subreddit is required");
+        validateRedditId(subreddit, "subreddit");
 
         const data = await redditGet<{
           data: {
@@ -701,6 +776,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const username = String(args.username ?? "");
         if (!username)
           throw new McpError(ErrorCode.InvalidParams, "username is required");
+        validateRedditId(username, "username");
 
         const data = await redditGet<{
           data: {
@@ -745,6 +821,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const username = String(args.username ?? "");
         if (!username)
           throw new McpError(ErrorCode.InvalidParams, "username is required");
+        validateRedditId(username, "username");
         const sort = String(args.sort ?? "new");
         const limit = clampLimit(args.limit);
 

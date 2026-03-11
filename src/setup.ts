@@ -4,7 +4,9 @@
  *
  * Interactively prompts for Reddit credentials and stores them securely in the
  * OS keychain (macOS Keychain, Windows Credential Manager, or Linux Secret
- * Service).  Credentials are NEVER written to any file on disk by this script.
+ * Service) when available. If keychain storage is unavailable, credentials may
+ * be written to a local `.env` file in the current directory (gitignored and
+ * created with restrictive permissions) and should be treated as sensitive.
  *
  * Usage:
  *   npm run setup
@@ -63,6 +65,10 @@ function promptPassword(question: string): Promise<string> {
         process.stdout.write("\n");
         resolve(password);
       } else if (char === "\u0003" /* Ctrl+C */) {
+        process.stdin.setRawMode(false);
+        process.stdin.pause();
+        process.stdin.removeListener("data", onData);
+        rl.close();
         process.stdout.write("\n");
         process.exit(130);
       } else if (char === "\u007F" /* Backspace */) {
