@@ -1,7 +1,7 @@
 # reddit-mcp
 
-A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server that gives Claude Code **read-only access to Reddit** via the official Reddit OAuth2 API.  
-You authenticate as your own Reddit account so that Claude can browse your personalized front page, search posts, read threads, and look up user and subreddit information—all without writing a single post or comment.
+A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server that gives Claude Code **read-only access to Reddit** for research purposes via the official Reddit OAuth2 API.  
+You authenticate as your own Reddit account so that Claude can search posts, read full discussions, and look up subreddit and user information—all without writing a single post or comment.
 
 ---
 
@@ -23,16 +23,11 @@ You authenticate as your own Reddit account so that Claude can browse your perso
 
 | Capability | Tool name |
 |---|---|
-| Hot posts in a subreddit | `get_hot_posts` |
-| New posts in a subreddit | `get_new_posts` |
-| Top posts in a subreddit | `get_top_posts` |
-| Rising posts in a subreddit | `get_rising_posts` |
 | Site-wide or subreddit search | `search_reddit` |
-| Full post + comments | `get_post_details` |
+| Full post + **complete** comment tree | `get_post_details` |
 | Subreddit metadata | `get_subreddit_info` |
 | User profile & karma | `get_user_profile` |
 | Posts submitted by a user | `get_user_posts` |
-| Authenticated front page feed | `get_frontpage` |
 
 All operations are **read-only**—the server requests only the `read` OAuth scope and never writes to Reddit.
 
@@ -161,51 +156,6 @@ Add the server to your MCP configuration file (`~/Library/Application Support/Cl
 
 ## Available tools
 
-### `get_hot_posts`
-
-Returns the current hot posts in a subreddit.
-
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `subreddit` | string | ✅ | Subreddit name (without `r/`) |
-| `limit` | number | | Posts to return, 1–100 (default 25) |
-
----
-
-### `get_new_posts`
-
-Returns the most recent posts in a subreddit.
-
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `subreddit` | string | ✅ | Subreddit name (without `r/`) |
-| `limit` | number | | Posts to return, 1–100 (default 25) |
-
----
-
-### `get_top_posts`
-
-Returns the top-scoring posts in a subreddit over a given time window.
-
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `subreddit` | string | ✅ | Subreddit name (without `r/`) |
-| `time` | string | | `hour` \| `day` \| `week` \| `month` \| `year` \| `all` (default `day`) |
-| `limit` | number | | Posts to return, 1–100 (default 25) |
-
----
-
-### `get_rising_posts`
-
-Returns trending/rising posts in a subreddit.
-
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `subreddit` | string | ✅ | Subreddit name (without `r/`) |
-| `limit` | number | | Posts to return, 1–100 (default 25) |
-
----
-
 ### `search_reddit`
 
 Searches Reddit for posts matching a query, optionally restricted to a single subreddit.
@@ -222,16 +172,24 @@ Searches Reddit for posts matching a query, optionally restricted to a single su
 
 ### `get_post_details`
 
-Fetches the full body text of a post and its comments (up to 5 levels deep).
+Fetches the full body text of a post and its **complete** comment tree.
+
+Reddit's API paginates large threads using continuation tokens ("more" objects).
+This tool transparently resolves all such tokens — issuing as many follow-up
+requests as needed — so the entire discussion is returned in a single call.
+You never need to think about pagination or depth limits.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `post_id` | string | ✅ | Reddit post ID (alphanumeric, e.g. `15abc12`) |
-| `subreddit` | string | | Subreddit the post belongs to (speeds up the API call) |
-| `comment_limit` | number | | Max top-level comments to return (default 20) |
+| `subreddit` | string | | Subreddit the post belongs to (optional, speeds up the request) |
 
 The post ID can be found in the URL:  
 `reddit.com/r/python/comments/**15abc12**/my_post_title/`
+
+> **Note**: For posts with very large comment sections (tens of thousands of
+> comments) the tool will include a `warning` field in the response if the
+> complete tree could not be fetched within the API call budget.
 
 ---
 
@@ -257,23 +215,12 @@ Returns public profile information for a Reddit user: karma breakdown, account a
 
 ### `get_user_posts`
 
-Returns posts recently submitted by a user.
+Returns posts submitted by a user.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `username` | string | ✅ | Reddit username (without `u/`) |
 | `sort` | string | | `new` \| `hot` \| `top` \| `controversial` (default `new`) |
-| `limit` | number | | Posts to return, 1–100 (default 25) |
-
----
-
-### `get_frontpage`
-
-Returns posts from the authenticated user's personalized front page (based on their subscribed subreddits).
-
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `sort` | string | | `hot` \| `new` \| `top` \| `rising` (default `hot`) |
 | `limit` | number | | Posts to return, 1–100 (default 25) |
 
 ---

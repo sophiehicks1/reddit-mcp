@@ -70,9 +70,7 @@ async function getAccessToken(): Promise<string> {
 
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(
-      `Reddit OAuth2 error ${response.status}: ${text}`
-    );
+    throw new Error(`Reddit OAuth2 error ${response.status}: ${text}`);
   }
 
   const data = (await response.json()) as {
@@ -93,9 +91,12 @@ async function getAccessToken(): Promise<string> {
   return cachedToken.access_token;
 }
 
-async function redditGet<T>(path: string, params?: Record<string, string>): Promise<T> {
+async function redditGet<T>(
+  path: string,
+  params?: Record<string, string>
+): Promise<T> {
   const token = await getAccessToken();
-  const userAgent = requireEnv("REDDIT_USER_AGENT");
+  const { userAgent } = await getCredentials();
 
   const url = new URL(`https://oauth.reddit.com${path}`);
   if (params) {
@@ -123,7 +124,7 @@ async function redditGet<T>(path: string, params?: Record<string, string>): Prom
 }
 
 // ---------------------------------------------------------------------------
-// Data helpers
+// Post formatting helper
 // ---------------------------------------------------------------------------
 
 interface RedditPost {
@@ -142,16 +143,6 @@ interface RedditPost {
   flair_text: string | null;
   over_18: boolean;
   stickied: boolean;
-}
-
-interface RedditComment {
-  id: string;
-  author: string;
-  body: string;
-  score: number;
-  created_utc: number;
-  depth: number;
-  replies?: RedditComment[];
 }
 
 function formatPost(data: RedditPost): Record<string, unknown> {
@@ -174,34 +165,251 @@ function formatPost(data: RedditPost): Record<string, unknown> {
   };
 }
 
-function extractComments(listing: unknown, maxDepth = 5): RedditComment[] {
-  if (!listing || typeof listing !== "object") return [];
-  const l = listing as { kind?: string; data?: { children?: unknown[] } };
-  if (l.kind !== "Listing" || !l.data?.children) return [];
+// ---------------------------------------------------------------------------
+// Full comment-tree fetching
+//
+// Reddit returns "more" objects wherever it has truncated the thread, both
+// for breadth (too many siblings) and depth (reply chain too deep).  We must
+// resolve them iteratively via GET /api/morechildren until none remain.
+//
+// Strategy:
+//  1. Fetch the initial post+comments response (high limit, no depth cap).
+//  2. Walk the tree: store every t1 comment in a flat map keyed by ID; collect
+//     every "more" stub into a pending queue.
+//  3. Loop: batch the pending IDs (≤100 per API call), call /api/morechildren,
+//     add resulting t1 comments to the flat map, queue any new "more" stubs.
+//  4. When the queue is empty, reconstruct the nested tree from the flat map
+//     using parent_id links and the insertion-order maps built in steps 2–3.
+// ---------------------------------------------------------------------------
 
-  return l.data.children
-    .map((child: unknown) => {
-      const c = child as { kind?: string; data?: Record<string, unknown> };
-      if (c.kind !== "t1" || !c.data) return null;
+/** Flat representation of a single comment used during tree construction. */
+interface FlatComment {
+  id: string;
+  author: string;
+  body: string;
+  score: number;
+  created_utc: number;
+  depth: number;
+  parent_id: string; // full Reddit name, e.g. "t1_abc" or "t3_xyz"
+}
+
+/** A "more" stub: a list of comment IDs that still need to be fetched. */
+interface MoreStub {
+  ids: string[];
+  parent_id: string; // full Reddit name of the parent
+}
+
+/** The output comment shape returned to the caller. */
+interface RedditComment {
+  id: string;
+  author: string;
+  body: string;
+  score: number;
+  created_utc: number;
+  depth: number;
+  replies: RedditComment[];
+}
+
+/**
+ * Recursively walk one Listing node from the initial API response, populating
+ * commentMap / replyOrder and collecting any "more" stubs.
+ */
+function walkListing(
+  listing: unknown,
+  commentMap: Map<string, FlatComment>,
+  replyOrder: Map<string, string[]>,
+  pending: MoreStub[]
+): void {
+  if (!listing || typeof listing !== "object") return;
+  const l = listing as { kind?: string; data?: { children?: unknown[] } };
+  if (l.kind !== "Listing" || !Array.isArray(l.data?.children)) return;
+
+  for (const child of l.data!.children!) {
+    const c = child as { kind?: string; data?: Record<string, unknown> };
+    if (!c.data) continue;
+
+    if (c.kind === "t1") {
       const d = c.data;
-      const comment: RedditComment = {
-        id: String(d.id ?? ""),
+      const id = String(d.id ?? "");
+      const parentFullId = String(d.parent_id ?? "");
+
+      commentMap.set(id, {
+        id,
         author: String(d.author ?? "[deleted]"),
         body: String(d.body ?? ""),
         score: Number(d.score ?? 0),
         created_utc: Number(d.created_utc ?? 0),
         depth: Number(d.depth ?? 0),
-      };
+        parent_id: parentFullId,
+      });
+
+      // Record this comment under its parent's ordered reply list.
+      const parentId = parentFullId.replace(/^t\d+_/, "");
+      if (!replyOrder.has(parentId)) replyOrder.set(parentId, []);
+      replyOrder.get(parentId)!.push(id);
+
+      // Recurse into inline replies.
       if (
-        maxDepth > 0 &&
         d.replies &&
         typeof d.replies === "object" &&
         (d.replies as Record<string, unknown>).kind === "Listing"
       ) {
-        comment.replies = extractComments(d.replies, maxDepth - 1);
+        walkListing(d.replies, commentMap, replyOrder, pending);
       }
-      return comment;
-    })
+    } else if (c.kind === "more") {
+      const d = c.data;
+      const ids = Array.isArray(d.children) ? d.children.map(String) : [];
+      if (ids.length > 0) {
+        pending.push({
+          ids,
+          parent_id: String(d.parent_id ?? ""),
+        });
+      }
+    }
+  }
+}
+
+/**
+ * Maximum number of /api/morechildren API calls to issue for a single
+ * get_post_details request.
+ *
+ * Each call fetches up to BATCH_SIZE (100) comment IDs.  At Reddit's OAuth
+ * rate limit of 60 requests/minute, 100 calls equates to roughly 100 seconds
+ * of API time and up to ~10 000 comments in the best case (fewer when
+ * comments are deleted or batches are smaller).  Posts that still have
+ * unresolved stubs after this cap will include a warning in the response.
+ */
+const MAX_MORE_CALLS = 100;
+
+/**
+ * Resolve all "more" stubs by iteratively calling /api/morechildren.
+ * Returns true when the tree is fully resolved, false when the call cap was
+ * reached (some stubs remain unresolved).
+ */
+async function resolveAllMore(
+  postFullName: string,
+  commentMap: Map<string, FlatComment>,
+  replyOrder: Map<string, string[]>,
+  initialPending: MoreStub[]
+): Promise<boolean> {
+  const BATCH_SIZE = 100;
+  let pending = initialPending;
+  let callCount = 0;
+  let fullyResolved = true;
+
+  while (pending.length > 0) {
+    const nextRound: MoreStub[] = [];
+
+    for (const stub of pending) {
+      for (let i = 0; i < stub.ids.length; i += BATCH_SIZE) {
+        if (callCount >= MAX_MORE_CALLS) {
+          fullyResolved = false;
+          break;
+        }
+
+        const batch = stub.ids.slice(i, i + BATCH_SIZE);
+        callCount++;
+
+        try {
+          const result = await redditGet<{
+            json: {
+              data: {
+                things: Array<{
+                  kind: string;
+                  data: Record<string, unknown>;
+                }>;
+              };
+            };
+          }>("/api/morechildren", {
+            link_id: postFullName,
+            children: batch.join(","),
+            api_type: "json",
+          });
+
+          const things = result?.json?.data?.things ?? [];
+
+          for (const thing of things) {
+            if (thing.kind === "t1") {
+              const d = thing.data;
+              const id = String(d.id ?? "");
+              const parentFullId = String(d.parent_id ?? stub.parent_id);
+
+              commentMap.set(id, {
+                id,
+                author: String(d.author ?? "[deleted]"),
+                body: String(d.body ?? ""),
+                score: Number(d.score ?? 0),
+                created_utc: Number(d.created_utc ?? 0),
+                depth: Number(d.depth ?? 0),
+                parent_id: parentFullId,
+              });
+
+              const parentId = parentFullId.replace(/^t\d+_/, "");
+              if (!replyOrder.has(parentId)) replyOrder.set(parentId, []);
+              replyOrder.get(parentId)!.push(id);
+            } else if (thing.kind === "more") {
+              const d = thing.data;
+              const ids = Array.isArray(d.children)
+                ? d.children.map(String)
+                : [];
+              if (ids.length > 0) {
+                nextRound.push({
+                  ids,
+                  parent_id: String(d.parent_id ?? stub.parent_id),
+                });
+              }
+            }
+          }
+        } catch (err) {
+          // Log and skip; don't abort the whole traversal for one failed batch.
+          console.error(
+            `morechildren batch failed (${batch.length} ids): ${err}`
+          );
+        }
+      }
+
+      if (!fullyResolved) break;
+    }
+
+    pending = nextRound;
+    if (!fullyResolved) break;
+  }
+
+  return fullyResolved;
+}
+
+/**
+ * Build the nested RedditComment tree from the flat maps gathered during
+ * tree traversal.
+ */
+function buildCommentTree(
+  rootId: string,
+  commentMap: Map<string, FlatComment>,
+  replyOrder: Map<string, string[]>
+): RedditComment[] {
+  function build(id: string): RedditComment | null {
+    const flat = commentMap.get(id);
+    if (!flat) return null;
+
+    const childIds = replyOrder.get(id) ?? [];
+    const replies = childIds
+      .map(build)
+      .filter((c): c is RedditComment => c !== null);
+
+    return {
+      id: flat.id,
+      author: flat.author,
+      body: flat.body,
+      score: flat.score,
+      created_utc: flat.created_utc,
+      depth: flat.depth,
+      replies,
+    };
+  }
+
+  const topLevelIds = replyOrder.get(rootId) ?? [];
+  return topLevelIds
+    .map(build)
     .filter((c): c is RedditComment => c !== null);
 }
 
@@ -211,95 +419,13 @@ function extractComments(listing: unknown, maxDepth = 5): RedditComment[] {
 
 const server = new Server(
   { name: "reddit-mcp", version: "1.0.0" },
-  {
-    capabilities: {
-      tools: {},
-    },
-  }
+  { capabilities: { tools: {} } }
 );
 
 // ---- List tools -----------------------------------------------------------
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
-    {
-      name: "get_hot_posts",
-      description:
-        "Get the current hot posts from a subreddit. Returns post titles, scores, comment counts, and URLs.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          subreddit: {
-            type: "string",
-            description: "Subreddit name without the r/ prefix (e.g. 'python').",
-          },
-          limit: {
-            type: "number",
-            description: "Number of posts to return (1–100, default 25).",
-          },
-        },
-        required: ["subreddit"],
-      },
-    },
-    {
-      name: "get_new_posts",
-      description: "Get the newest posts from a subreddit.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          subreddit: {
-            type: "string",
-            description: "Subreddit name without the r/ prefix.",
-          },
-          limit: {
-            type: "number",
-            description: "Number of posts to return (1–100, default 25).",
-          },
-        },
-        required: ["subreddit"],
-      },
-    },
-    {
-      name: "get_top_posts",
-      description: "Get the top posts from a subreddit over a given time period.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          subreddit: {
-            type: "string",
-            description: "Subreddit name without the r/ prefix.",
-          },
-          time: {
-            type: "string",
-            enum: ["hour", "day", "week", "month", "year", "all"],
-            description: "Time period (default 'day').",
-          },
-          limit: {
-            type: "number",
-            description: "Number of posts to return (1–100, default 25).",
-          },
-        },
-        required: ["subreddit"],
-      },
-    },
-    {
-      name: "get_rising_posts",
-      description: "Get the rising (trending) posts from a subreddit.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          subreddit: {
-            type: "string",
-            description: "Subreddit name without the r/ prefix.",
-          },
-          limit: {
-            type: "number",
-            description: "Number of posts to return (1–100, default 25).",
-          },
-        },
-        required: ["subreddit"],
-      },
-    },
     {
       name: "search_reddit",
       description:
@@ -337,7 +463,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "get_post_details",
       description:
-        "Get full details for a Reddit post including its body text and top-level comments.",
+        "Get the full body text and complete comment tree for a Reddit post. " +
+        "All comments at every depth level are returned — the server transparently " +
+        "resolves Reddit's pagination tokens so you always get the full discussion.",
       inputSchema: {
         type: "object",
         properties: {
@@ -349,11 +477,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           subreddit: {
             type: "string",
             description:
-              "The subreddit the post belongs to (without r/ prefix). If omitted, a generic path is used.",
-          },
-          comment_limit: {
-            type: "number",
-            description: "Maximum number of top-level comments to return (default 20).",
+              "The subreddit the post belongs to (without r/ prefix). Optional but speeds up the request.",
           },
         },
         required: ["post_id"],
@@ -377,7 +501,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "get_user_profile",
       description:
-        "Get public profile information for a Reddit user: karma, account age, and trophy list.",
+        "Get public profile information for a Reddit user: karma, account age, and verification status.",
       inputSchema: {
         type: "object",
         properties: {
@@ -391,7 +515,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "get_user_posts",
-      description: "Get recent posts submitted by a Reddit user.",
+      description: "Get posts submitted by a Reddit user.",
       inputSchema: {
         type: "object",
         properties: {
@@ -412,25 +536,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["username"],
       },
     },
-    {
-      name: "get_frontpage",
-      description:
-        "Get the authenticated user's personalized Reddit frontpage (their subscribed subreddits feed).",
-      inputSchema: {
-        type: "object",
-        properties: {
-          sort: {
-            type: "string",
-            enum: ["hot", "new", "top", "rising"],
-            description: "Feed sort order (default 'hot').",
-          },
-          limit: {
-            type: "number",
-            description: "Number of posts to return (1–100, default 25).",
-          },
-        },
-      },
-    },
   ],
 }));
 
@@ -446,50 +551,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   try {
     switch (name) {
-      // ---- Listing tools ---------------------------------------------------
-
-      case "get_hot_posts":
-      case "get_new_posts":
-      case "get_rising_posts": {
-        const subreddit = String(args.subreddit ?? "");
-        if (!subreddit) throw new McpError(ErrorCode.InvalidParams, "subreddit is required");
-        const sortMap: Record<string, string> = {
-          get_hot_posts: "hot",
-          get_new_posts: "new",
-          get_rising_posts: "rising",
-        };
-        const sort = sortMap[name];
-        const limit = clampLimit(args.limit);
-        const data = await redditGet<{ data: { children: { data: RedditPost }[] } }>(
-          `/r/${subreddit}/${sort}`,
-          { limit: String(limit) }
-        );
-        const posts = data.data.children.map((c) => formatPost(c.data));
-        return {
-          content: [{ type: "text", text: JSON.stringify(posts, null, 2) }],
-        };
-      }
-
-      case "get_top_posts": {
-        const subreddit = String(args.subreddit ?? "");
-        if (!subreddit) throw new McpError(ErrorCode.InvalidParams, "subreddit is required");
-        const time = String(args.time ?? "day");
-        const limit = clampLimit(args.limit);
-        const data = await redditGet<{ data: { children: { data: RedditPost }[] } }>(
-          `/r/${subreddit}/top`,
-          { limit: String(limit), t: time }
-        );
-        const posts = data.data.children.map((c) => formatPost(c.data));
-        return {
-          content: [{ type: "text", text: JSON.stringify(posts, null, 2) }],
-        };
-      }
-
       // ---- Search ----------------------------------------------------------
 
       case "search_reddit": {
         const query = String(args.query ?? "");
-        if (!query) throw new McpError(ErrorCode.InvalidParams, "query is required");
+        if (!query)
+          throw new McpError(ErrorCode.InvalidParams, "query is required");
         const sort = String(args.sort ?? "relevance");
         const time = String(args.time ?? "all");
         const limit = clampLimit(args.limit);
@@ -505,51 +572,81 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           : "/search";
         if (args.subreddit) params.restrict_sr = "true";
 
-        const data = await redditGet<{ data: { children: { data: RedditPost }[] } }>(
-          path,
-          params
-        );
+        const data = await redditGet<{
+          data: { children: { data: RedditPost }[] };
+        }>(path, params);
         const posts = data.data.children.map((c) => formatPost(c.data));
         return {
           content: [{ type: "text", text: JSON.stringify(posts, null, 2) }],
         };
       }
 
-      // ---- Post details ----------------------------------------------------
+      // ---- Post details (full comment tree) --------------------------------
 
       case "get_post_details": {
         const postId = String(args.post_id ?? "");
-        if (!postId) throw new McpError(ErrorCode.InvalidParams, "post_id is required");
-        const commentLimit = clampLimit(args.comment_limit, 20);
-        const sub = args.subreddit ? `/r/${String(args.subreddit)}` : "";
-        const path = `${sub}/comments/${postId}`;
+        if (!postId)
+          throw new McpError(ErrorCode.InvalidParams, "post_id is required");
 
-        const data = await redditGet<unknown[]>(path, {
-          limit: String(commentLimit),
-          depth: "5",
+        const sub = args.subreddit ? `/r/${String(args.subreddit)}` : "";
+
+        // Fetch the post and as many comments as Reddit will return in one go.
+        // limit=500 requests the maximum number of top-level comment stubs;
+        // omitting depth lets Reddit use its default (which already goes quite
+        // deep).  "more" stubs at any level are resolved below.
+        const data = await redditGet<unknown[]>(`${sub}/comments/${postId}`, {
+          limit: "500",
         });
 
         if (!Array.isArray(data) || data.length < 1) {
-          throw new McpError(ErrorCode.InternalError, "Unexpected response from Reddit API");
+          throw new McpError(
+            ErrorCode.InternalError,
+            "Unexpected response from Reddit API"
+          );
         }
 
-        // First element is the post listing
-        const postListing = data[0] as { data: { children: { data: RedditPost }[] } };
+        // --- Parse the post --------------------------------------------------
+        const postListing = data[0] as {
+          data: { children: { data: RedditPost }[] };
+        };
         const postData = postListing.data.children[0]?.data;
         if (!postData) {
           throw new McpError(ErrorCode.InternalError, "Post not found");
         }
         const post = formatPost(postData);
+        const postFullName = `t3_${postId}`;
 
-        // Second element is the comment listing
-        const comments = data.length > 1 ? extractComments(data[1]) : [];
+        // --- Walk the initial comment listing --------------------------------
+        const commentMap = new Map<string, FlatComment>();
+        const replyOrder = new Map<string, string[]>(); // parent id → ordered child ids
+        const pending: MoreStub[] = [];
+
+        if (data.length > 1) {
+          walkListing(data[1], commentMap, replyOrder, pending);
+        }
+
+        // --- Resolve all "more" stubs ----------------------------------------
+        const fullyResolved = await resolveAllMore(
+          postFullName,
+          commentMap,
+          replyOrder,
+          pending
+        );
+
+        // --- Build and return the nested tree --------------------------------
+        const comments = buildCommentTree(postId, commentMap, replyOrder);
+
+        const result: Record<string, unknown> = { post, comments };
+        if (!fullyResolved) {
+          result.warning =
+            `This post has an exceptionally large comment section. ` +
+            `The server reached the API call budget (${MAX_MORE_CALLS} requests) ` +
+            `before the full tree could be fetched; some comments may be missing.`;
+        }
 
         return {
           content: [
-            {
-              type: "text",
-              text: JSON.stringify({ post, comments }, null, 2),
-            },
+            { type: "text", text: JSON.stringify(result, null, 2) },
           ],
         };
       }
@@ -558,20 +655,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "get_subreddit_info": {
         const subreddit = String(args.subreddit ?? "");
-        if (!subreddit) throw new McpError(ErrorCode.InvalidParams, "subreddit is required");
+        if (!subreddit)
+          throw new McpError(ErrorCode.InvalidParams, "subreddit is required");
 
         const data = await redditGet<{
           data: {
             display_name: string;
             title: string;
             public_description: string;
-            description: string;
             subscribers: number;
             active_user_count: number;
             created_utc: number;
             over18: boolean;
             url: string;
-            community_icon: string;
           };
         }>(`/r/${subreddit}/about`);
 
@@ -603,7 +699,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "get_user_profile": {
         const username = String(args.username ?? "");
-        if (!username) throw new McpError(ErrorCode.InvalidParams, "username is required");
+        if (!username)
+          throw new McpError(ErrorCode.InvalidParams, "username is required");
 
         const data = await redditGet<{
           data: {
@@ -646,34 +743,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "get_user_posts": {
         const username = String(args.username ?? "");
-        if (!username) throw new McpError(ErrorCode.InvalidParams, "username is required");
+        if (!username)
+          throw new McpError(ErrorCode.InvalidParams, "username is required");
         const sort = String(args.sort ?? "new");
         const limit = clampLimit(args.limit);
 
-        const data = await redditGet<{ data: { children: { data: RedditPost }[] } }>(
-          `/user/${username}/submitted`,
-          { sort, limit: String(limit) }
-        );
-
-        const posts = data.data.children.map((c) => formatPost(c.data));
-        return {
-          content: [{ type: "text", text: JSON.stringify(posts, null, 2) }],
-        };
-      }
-
-      // ---- Frontpage -------------------------------------------------------
-
-      case "get_frontpage": {
-        const sort = String(args.sort ?? "hot");
-        const limit = clampLimit(args.limit);
-
-        const validSorts = ["hot", "new", "top", "rising"];
-        const safeSortInput = validSorts.includes(sort) ? sort : "hot";
-
-        const data = await redditGet<{ data: { children: { data: RedditPost }[] } }>(
-          `/${safeSortInput}`,
-          { limit: String(limit) }
-        );
+        const data = await redditGet<{
+          data: { children: { data: RedditPost }[] };
+        }>(`/user/${username}/submitted`, { sort, limit: String(limit) });
 
         const posts = data.data.children.map((c) => formatPost(c.data));
         return {
